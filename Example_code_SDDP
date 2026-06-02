@@ -1,0 +1,786 @@
+
+import pyomo.environ as pyo
+from pyomo.opt import SolverFactory
+import numpy as np
+from pathlib import Path
+
+
+
+### Set ###
+T = list(range(0, TOTAL_HOURS))
+E = ["DA", "ID Sell", "ID Buy"]  # Energy markets
+C = ["aFRR Up", "aFRR Down", "FCR-N", "FCR-D"]  # Capacity markets
+C_d = ["aFRR Down", "FCR-N"]  # Subset of C with Downward capacity markets
+C_u = ["aFRR Up", "FCR-N", "FCR-D"]  # Subset of C with Upward capacity markets
+
+### Parameters ###
+nT = len(T)
+P_e_t = {}
+da_vals = df_DA.iloc[:nT, 0].values
+id_values_sell = full_year_data['Sell Volume MWh'].values[:nT]
+id_values_buy = full_year_data['Buy volume MWh'].values[:nT]
+id_prices_sell = full_year_data['VolumeWeightedPrice'].values[:nT]
+id_prices_buy = full_year_data['VolumeWeightedPrice'].values[:nT]
+
+for i, t in enumerate(T):
+    P_e_t[("DA", t)] = float(da_vals[i])
+    P_e_t[("ID Sell", t)] = float(id_prices_sell[i])
+    P_e_t[("ID Buy", t)] = float(id_prices_buy[i])
+
+
+P_c_t: dict[int, dict[str, dict]] = {}
+for r in range(3):
+    P_c_t[r] = {}
+    for level in PRICE_LEVELS:
+        _afrr_df = _synthetic_dfs[level]["aFRR"]
+        _fcrn_df = _synthetic_dfs[level]["FCR-N"]
+        _fcrd_df = _synthetic_dfs[level]["FCR-D"]
+
+        _afrr_up_prices   = build_hourly_price_series(_afrr_df,  _regime_week_dicts["aFRR"][r],  col_suffix=" Up",   total_hours=TOTAL_HOURS)
+        _afrr_down_prices = build_hourly_price_series(_afrr_df,  _regime_week_dicts["aFRR"][r],  col_suffix=" Down", total_hours=TOTAL_HOURS)
+        _fcrn_prices      = build_hourly_price_series(_fcrn_df,  _regime_week_dicts["FCR-N"][r], col_suffix="",      total_hours=TOTAL_HOURS)
+        _fcrd_prices      = build_hourly_price_series(_fcrd_df,  _regime_week_dicts["FCR-D"][r], col_suffix="",      total_hours=TOTAL_HOURS)
+
+        P_c_t[r][level] = {}
+        for i, t in enumerate(T):
+            P_c_t[r][level][("aFRR Up",   t)] = float(_afrr_up_prices[i])
+            P_c_t[r][level][("aFRR Down", t)] = float(_afrr_down_prices[i])
+            P_c_t[r][level][("FCR-N",     t)] = float(_fcrn_prices[i])
+            P_c_t[r][level][("FCR-D",     t)] = float(_fcrd_prices[i])
+
+
+# Reserve price uncertainty: 3 independent levels sampled uniformly per SDDP stage.
+# In the backward pass each (spot/inflow regime, reserve level) combination is evaluated,
+# giving 3 × 3 = 9 joint scenarios per stage with probability Markov(r_next|r_curr) × 1/3.
+RESERVE_PRICE_LEVELS = ["low", "mid", "high"]
+RESERVE_PRICE_N      = len(RESERVE_PRICE_LEVELS)
+
+
+
+### Placeholder values ###
+C_max = "# Value #"
+C_min = "# Value #"
+
+
+
+
+
+
+
+
+
+S_max = "# Value #"
+S_min = "# Value #"
+
+V_c_t_max_orig = {"aFRR Up": "# Value #", "aFRR Down": "# Value #", "FCR-N": "# Value #", "FCR-D": "# Value #"}
+
+V_e_t_max = {}
+for t in T:
+    V_e_t_max[("ID Sell", t)] = float(id_values_sell[t])
+    V_e_t_max[("ID Buy",  t)] = float(id_values_buy[t])
+
+
+# Creating dict:
+V_c_t_max = {}
+for c in V_c_t_max_orig:
+    for t in T:
+        V_c_t_max[(c, t)] = float(V_c_t_max_orig[c])
+
+S_0 = "# Value #"
+
+A_e = {"ID Sell": "# Value #", "ID Buy": "# Value #"}
+
+
+### Helper Functions for Turbine and Generator Efficiency ###
+def get_turbine_generator_data():
+    # CODE #
+    # Data removed for confidentiality # 
+    return turbin_list_MW, gen_out
+
+
+def create_coeff(x_points, y_points):
+    """
+    Create piecewise linear coefficients (slopes and intercepts) for turbine-generator efficiency.
+    """
+    m_list = []
+    b_list = []
+    for i in range(len(x_points) - 1):
+        x1, x2 = x_points[i], x_points[i + 1]
+        y1, y2 = y_points[i], y_points[i + 1]
+        m = (y2 - y1) / (x2 - x1)
+        b = y1
+        m_list.append(m)
+        b_list.append(b)
+    return np.array(m_list), np.array(b_list)
+
+
+
+
+
+### SDDP Algorithm Implementation ###
+# Building stage models, and the SDDP algorithm
+def create_stage_model(stage_hours, E, C, C_d, C_u, P_e_t, P_c_t, I_t,
+                       C_max, C_min, S_max, S_min, eta_plant,
+                       V_c_t_max, V_e_t_max, S_start, A_e, cuts,
+                       y_c_fixed=None, next_stage_hours=None,
+                       is_last_stage=False, S_end_target=None, S_end_min=None,
+                       delta_up=0.0175, delta_down=0.0095, allow_end_slack=False):
+
+    model = pyo.ConcreteModel()
+    
+    ### Sets ###
+    model.T = pyo.Set(initialize=stage_hours, ordered=True)
+    model.E = pyo.Set(initialize=E)
+    model.C = pyo.Set(initialize=C)
+    model.C_d = pyo.Set(initialize=C_d)
+    model.C_u = pyo.Set(initialize=C_u)
+    
+    ### Parameters ###
+    model.P_e_t = pyo.Param(model.E, model.T, initialize=lambda model, e, t: P_e_t.get((e, t), 0), mutable=True)
+    model.P_c_t = pyo.Param(model.C, model.T, initialize=lambda model, c, t: P_c_t.get((c, t), 0), mutable=True)
+    model.I_t = pyo.Param(model.T, initialize=lambda model, t: I_t.get(t, 0), mutable=True)
+    model.C_max = pyo.Param(initialize=C_max)
+    model.C_min = pyo.Param(initialize=C_min)
+    model.S_max = pyo.Param(initialize=S_max)
+    model.S_min = pyo.Param(initialize=S_min)
+    model.eta_plant = pyo.Param(initialize=eta_plant)
+    model.V_c_t_max = pyo.Param(model.C, model.T, initialize=lambda model, c, t: V_c_t_max.get((c, t), 0))
+    model.V_e_t_max = pyo.Param(model.E, model.T, initialize=lambda model, e, t: V_e_t_max.get((e, t), 0))
+    model.S_start = pyo.Param(initialize=S_start, mutable=True)
+    model.A_e = pyo.Param(model.E - {"DA"}, initialize=A_e, mutable=True)
+    model.delta_up = pyo.Param(initialize=delta_up)
+    model.delta_down = pyo.Param(initialize=delta_down)
+    
+    ### Decision variables ###
+    model.x_e_t = pyo.Var(model.E, model.T, domain=pyo.NonNegativeReals)
+    
+    # Capacity sales for CURRENT stage (decision variable)
+    model.y_c_t = pyo.Var(model.C, model.T, domain=pyo.NonNegativeReals)
+    
+    model.s_t = pyo.Var(model.T, within=pyo.NonNegativeReals)
+    model.P_hyd = pyo.Var(model.T, within=pyo.NonNegativeReals)
+    model.P_shaft = pyo.Var(model.T, within=pyo.NonNegativeReals)
+    
+
+    model.s_end = pyo.Var(within=pyo.NonNegativeReals)
+
+    # Start-of-stage reservoir level as an explicit variable (for clean dual extraction)
+    model.s_start_week = pyo.Var(within=pyo.NonNegativeReals)
+    
+    # Future value approximation (theta variable must be continous)
+    model.theta = pyo.Var(within=pyo.Reals, initialize=0)
+    model.theta.fix(0)
+    
+    
+    ### Objective Function ###
+    def objective_function(model):
+        immediate_value = (
+            sum(model.P_e_t[e, t] * model.x_e_t[e, t] for e in model.E if e != "ID Buy" for t in model.T) +
+            sum(model.P_c_t[c, t] * model.y_c_t[c, t] for c in model.C for t in model.T) -
+            sum(model.P_e_t["ID Buy", t] * model.x_e_t["ID Buy", t] for t in model.T)
+        )
+        # Penalty for emergency water inflow (artificial water addition)
+        immediate_value -= float(EMERGENCY_WATER_PENALTY_EUR_PER_GWH) * model.ex_water_inflow
+
+        
+        return immediate_value + model.theta
+    
+    model.OBJ = pyo.Objective(rule=objective_function, sense=pyo.maximize)
+    model.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+    
+    ### Constraints ###
+    # Start reservoir definition (state link): start-of-stage storage equals the incoming state S_start.
+    # The dual of this constraint is the marginal value of the start reservoir for the stage.
+    def start_reservoir_level_def_rule(model):
+        return model.s_start_week == model.S_start
+    model.Start_Reservoir_Level_Def = pyo.Constraint(rule=start_reservoir_level_def_rule)
+
+    # Initial reservoir balance (first hour in stage)
+    def initial_reservoir_balance_rule(model):
+        t0 = min(model.T)
+        return (
+            model.s_t[t0]
+            == model.s_start_week + model.I_t[t0] + model.ex_water_inflow - model.P_hyd[t0] / 1000
+        )
+    model.Initial_Reservoir_Balance = pyo.Constraint(rule=initial_reservoir_balance_rule)
+    
+    # End reservoir level constraint
+    def end_reservoir_level_rule(model):
+        return model.s_end == model.s_t[max(model.T)]
+    model.End_Reservoir_Level_Def = pyo.Constraint(rule=end_reservoir_level_rule)
+    
+    # For last stage end reservoiar:
+    if is_last_stage and S_end_target is not None:
+        def end_reservoir_target_rule(model):
+            return model.s_end == S_end_target
+        model.End_Reservoir_Target = pyo.Constraint(rule=end_reservoir_target_rule)
+    
+    # Cuts from future periods (Benders cuts)
+    model.cut_constraints = pyo.ConstraintList()
+    for cut in cuts:
+        expr = cut['intercept'] + cut['slope_v'] * (model.s_end - cut['state_v'])
+        model.cut_constraints.add(model.theta <= expr)
+    
+    # Reservoir storage constraints
+    def reservoir_storage_rule_max(model, t):
+        return model.s_t[t] <= model.S_max - model.delta_down
+    model.Reservoir_Storage_Max = pyo.Constraint(model.T, rule=reservoir_storage_rule_max)
+    
+    def reservoir_storage_rule_min(model, t):
+        return model.s_t[t] >= model.S_min + model.delta_up
+    model.Reservoir_Storage_Min = pyo.Constraint(model.T, rule=reservoir_storage_rule_min)
+    
+    # PQ constraint (turbine and generator efficiency)
+    turbin_list_MW, gen_out = get_turbine_generator_data()
+    m_turb, b_gen = create_coeff(turbin_list_MW, gen_out)
+    
+    def pq_constraint_rule(model, t, i):
+        production = sum(model.x_e_t[e, t] for e in model.E if e != "ID Buy") - model.x_e_t["ID Buy", t]
+        return production <= m_turb[i] * (model.P_hyd[t] - turbin_list_MW[i]) + b_gen[i]
+    model.pq_constraint = pyo.Constraint(model.T, range(len(m_turb)), rule=pq_constraint_rule)
+    
+    # Minimum production constraint:
+    def turbine_capacity_min_rule(model, t):
+        production = sum(model.x_e_t[e, t] for e in model.E if e != "ID Buy") - model.x_e_t["ID Buy", t]
+        return production >= model.C_min
+    model.Turbine_Capacity_Min = pyo.Constraint(model.T, rule=turbine_capacity_min_rule)
+
+    # Maximum turbine production constraint:
+    def turbine_capacity_rule_max(model, t):
+        production = sum(model.x_e_t[e, t] for e in model.E if e != "ID Buy") - model.x_e_t["ID Buy", t]
+        return production <= model.C_max
+    model.Turbine_Capacity_Max = pyo.Constraint(model.T, rule=turbine_capacity_rule_max)
+    
+    
+    # Reservoir balance 
+    def reservoir_balance_rule(model, t):
+        if t == min(model.T):
+            return pyo.Constraint.Skip
+        return model.s_t[t] == model.s_t[t-1] + model.I_t[t] - model.P_hyd[t] / 1000
+    model.Reservoir_Balance = pyo.Constraint(model.T, rule=reservoir_balance_rule)
+    
+    # Bidding constraints
+    def bidding_constraint_down_rule(model, t):
+        production = sum(model.x_e_t[e, t] for e in model.E if e != "ID Buy") - model.x_e_t["ID Buy", t]
+        return sum(model.y_c_t[c, t] for c in model.C_d) <= production - C_min
+    model.Bidding_Constraint_Down = pyo.Constraint(model.T, rule=bidding_constraint_down_rule)
+    
+    def bidding_constraint_up_rule(model, t):
+        production = sum(model.x_e_t[e, t] for e in model.E if e != "ID Buy") - model.x_e_t["ID Buy", t]
+        return sum(model.y_c_t[c, t] for c in model.C_u) <= model.C_max - production
+    model.Bidding_Constraint_Up = pyo.Constraint(model.T, rule=bidding_constraint_up_rule)
+    
+    # Capacity market limits
+    def capacity_market_limit_rule(model, c, t):
+        return model.y_c_t[c, t] <= model.V_c_t_max[c, t]
+    model.Capacity_Market_Limit = pyo.Constraint(model.C, model.T, rule=capacity_market_limit_rule)
+    
+    # Intraday market limits
+    def intraday_market_limit_rule(model, e, t):
+        if e == "DA":
+            return pyo.Constraint.Skip
+        return model.x_e_t[e, t] <= model.V_e_t_max[e, t] * model.A_e[e]
+    model.Intraday_Market_Limit = pyo.Constraint(model.E, model.T, rule=intraday_market_limit_rule)
+    
+    return model
+
+
+def create_stages(num_stages, total_hours=8736):
+
+    hours_per_stage = total_hours // num_stages
+    stages = []
+    
+    for n in range(num_stages):
+        start = n * hours_per_stage
+        if n == num_stages - 1: 
+            end = total_hours
+        else:
+            end = start + hours_per_stage
+        stages.append(list(range(start, end)))
+    
+    return stages
+
+
+
+STAGES = create_stages(NUM_STAGES, total_hours=len(T))
+
+
+def update_model_prices(model, P_e_t_new, P_c_t_new):
+    for e in model.E:
+        for t in model.T:
+            if (e, t) in P_e_t_new:
+                model.P_e_t[e, t] = P_e_t_new[(e, t)]
+    
+    for c in model.C:
+        for t in model.T:
+            if (c, t) in P_c_t_new:
+                model.P_c_t[c, t] = P_c_t_new[(c, t)]
+
+
+
+def update_model_inflow(model, I_t_new):
+    
+    for t in model.T:
+        if t in I_t_new:
+            model.I_t[t] = float(I_t_new[t])
+
+
+def update_model_state(model, S_start_new, y_c_fixed_new=None):
+    model.S_start = S_start_new
+
+
+
+def add_cuts_to_model(model, new_cuts):
+    
+    # Unfix theta when adding the first cut (it was fixed to 0 to prevent unboundedness)
+    if model.theta.is_fixed():
+        model.theta.unfix()
+
+    for cut in new_cuts:
+        expr = cut['intercept'] + cut['slope_v'] * (model.s_end - cut['state_v'])
+        model.cut_constraints.add(model.theta <= expr)
+
+
+def generate_benders_cut(Q_values, lambda_v_values, v_state, probabilities=None):
+   
+
+    Q_avg = sum(Q * p for Q, p in zip(Q_values, probabilities))
+    lambda_v_avg = sum(lv * p for lv, p in zip(lambda_v_values, probabilities))
+    
+    cut = {
+        'intercept': Q_avg,
+        'slope_v': lambda_v_avg,
+        'state_v': v_state,
+    }
+    
+    return cut
+
+
+def sddp_algorithm_adaptive(
+    stages,
+    max_iterations=50,
+    num_scenarios=3,
+    convergence_tol=None,
+    forward_seed=None,
+    sample_forward_scenarios=True,
+    num_forward_paths=1,
+):
+   
+    num_stages = len(stages)
+
+    # Pre-assign a reserve price level to each stage with equal probability (1/3).
+    _reserve_rng = np.random.default_rng(forward_seed)
+    reserve_level_per_stage = {
+        n: RESERVE_PRICE_LEVELS[int(_reserve_rng.integers(RESERVE_PRICE_N))]
+        for n in range(num_stages)
+    }
+    _lv_counts = {lv: sum(1 for l in reserve_level_per_stage.values() if l == lv) for lv in RESERVE_PRICE_LEVELS}
+    print(f"Pre-assigned reserve price levels (low={_lv_counts['low']}, mid={_lv_counts['mid']}, high={_lv_counts['high']})")
+
+    rng = np.random.default_rng(forward_seed)
+
+    K_stages = {n: [] for n in range(num_stages - 1)}
+
+    
+
+    # Storage for results
+    iteration_results = []
+    
+    print("\n" + "="*80)
+    print(f"Adaptive SDDP Algorithm - {num_stages} Stages (OPTIMIZED)")
+    print(f"Max iterations: {max_iterations}, Scenarios: {num_scenarios}")
+    print("="*80 + "\n")
+    
+    
+    print("Pre-building stage models...")
+    stage_models = {}
+    solver = SolverFactory('gurobi')
+    solver.options['DualReductions'] = 0
+    
+    for n in range(num_stages):
+        stage_hours = stages[n]
+        is_last = (n == num_stages - 1)
+
+        _stage_level = reserve_level_per_stage[n]  # Pre-assigned reserve level for this stage
+        for r in range(3):
+            stage_models[(n, r)] = create_stage_model(
+                stage_hours=stage_hours,
+                E=E, C=C, C_d=C_d, C_u=C_u,
+                P_e_t=P_e_t,  # Base energy prices (overwritten per regime before each solve)
+                P_c_t=P_c_t[r][_stage_level],  # Reserve prices for pre-assigned level
+                I_t=I_t,
+                C_max=C_max, C_min=C_min,
+                S_max=S_max, S_min=S_min,
+                eta_plant=eta_plant,
+                V_c_t_max=V_c_t_max,
+                V_e_t_max=V_e_t_max,
+                S_start=S_0,
+                A_e=A_e,
+                cuts=[],
+                is_last_stage=is_last,
+                S_end_target=S_0 if is_last else None,
+                S_end_min=None,
+                allow_end_slack=is_last,
+            )
+
+    print(f"Built {num_stages * 3} stage models (3 regimes per stage, as reserve level is pre-assigned)")
+    
+    for iteration in range(max_iterations):
+        print(f"\n{'='*60}")
+        print(f"Iteration {iteration + 1}/{max_iterations}")
+        print(f"{'='*60}")
+        
+        print("\n--- Forward Pass ---")
+
+        
+        forward_paths = []
+
+        for path_idx in range(int(num_forward_paths)):
+            print(f"\n  Forward path {path_idx+1}/{int(num_forward_paths)}")
+            forward_path = {}  # Store results for each stage in this path
+            current_reservoir = S_0
+
+            current_regime = int(rng.choice(3, p=MARKOV_PI0)) if sample_forward_scenarios else 1
+
+            for n in range(num_stages):
+                print(f"\n  Stage {n+1}/{num_stages}")
+                stage_hours = stages[n]
+
+                regime = int(current_regime)
+                # Reserve price level is pre-assigned per stage (resolved by pre-processing).
+                reserve_level = reserve_level_per_stage[n]
+                # Stage parameters: spot+inflow from Thema regime, reserve prices from pre-assigned level.
+                from block_scenarios import build_stage_joint_scenarios_from_blocks
+
+                scen_list = build_stage_joint_scenarios_from_blocks(
+                    stage_index=int(n),
+                    stage_hours=list(stage_hours),
+                    base_P_e_t=P_e_t,
+                    base_P_c_t=P_c_t[regime][reserve_level],
+                    base_I_t=I_t,
+                    data=BLOCK_DATA,
+                    da_market="DA",
+                    energy_markets=list(E),
+                    capacity_markets=list(C),
+                )
+                match = [x for x in scen_list if int(x[4]) == int(regime)]
+                P_e_t_stage, P_c_t_stage, I_t_stage, scen_prob, _ = match[0] if match else scen_list[0]
+
+                
+                _fcrn_reserve_scen = _regime_week_dicts["FCR-N"][regime][n]
+                _afrr_reserve_scen = _regime_week_dicts["aFRR"][regime][n]
+                _fcrd_reserve_scen = _regime_week_dicts["FCR-D"][regime][n]
+                print(f"    Uke {n+1:>2} | Regime: {regime} | rep_year: {_rep_year} | "
+                      f"Reserve level: {reserve_level} | "
+                      f"Reserve scen → FCR-N: {_fcrn_reserve_scen}, FCR-D: {_fcrd_reserve_scen}, aFRR: {_afrr_reserve_scen}")
+
+                # SELECT the pre-built model for this regime (reserve level already baked in).
+                model_stage = stage_models[(n, int(regime))]
+                is_last = (n == num_stages - 1)
+
+                # Update energy prices
+                update_model_prices(model_stage, P_e_t_stage, P_c_t_stage)
+
+                # Update inflow
+                update_model_inflow(model_stage, I_t_stage)
+
+                # Update state
+                update_model_state(model_stage, current_reservoir, None)
+
+                # Solve model
+                results = solver.solve(model_stage, tee=False)        
+                end_reservoir = pyo.value(model_stage.s_end)
+                obj_stage = pyo.value(model_stage.OBJ)
+                theta_value = pyo.value(model_stage.theta)
+
+                
+                stage_energy_rev = {e: 0.0 for e in E}
+                stage_capacity_rev = {c: 0.0 for c in C}
+                for t in stage_hours:
+                    for e in E:
+                        x_val = float(pyo.value(model_stage.x_e_t[e, t]))
+                        price = float(pyo.value(model_stage.P_e_t[e, t]))
+                        if e == "ID Buy":
+                            stage_energy_rev[e] -= price * x_val
+                        else:
+                            stage_energy_rev[e] += price * x_val
+                    for c in C:
+                        y_val = float(pyo.value(model_stage.y_c_t[c, t]))
+                        stage_capacity_rev[c] += float(pyo.value(model_stage.P_c_t[c, t])) * y_val
+
+                true_revenue = float(sum(stage_energy_rev.values()) + sum(stage_capacity_rev.values()))
+
+                penalty_cost = 0.0
+                emergency_water = 0.0
+                if hasattr(model_stage, 'ex_water_inflow'):
+                    emergency_water = float(pyo.value(model_stage.ex_water_inflow))
+                    if emergency_water > 0.001:
+                        print(f"    Emergency water used: {emergency_water:.4f} GWh in Stage {n+1}")
+                        print(f"      Start reservoir was: {current_reservoir:.2f} GWh")
+                    if emergency_water > 0.0:
+                        penalty_cost += float(EMERGENCY_WATER_PENALTY_EUR_PER_GWH) * float(emergency_water)
+
+                total_penalty = penalty_cost
+
+                print(f"    Start reservoir: {current_reservoir:.2f} GWh")
+                print(f"    End reservoir: {end_reservoir:.2f} GWh")
+                print(f"    Stage revenue (without penalty/future): {true_revenue:.2f} EUR")
+                print(f"    Objective (with penalty + future): {obj_stage:.2f} EUR")
+                print(f"    Theta (future value): {theta_value:.2f} EUR")
+                if total_penalty > 0.01:
+                    print(f"    Penalty cost: {total_penalty:.2f} EUR")
+
+                forward_path[n] = {
+                    'start_reservoir': current_reservoir,
+                    'end_reservoir': end_reservoir,
+                    'objective': obj_stage,
+                    'theta': theta_value,
+                    'revenue': true_revenue,
+                    'penalty': total_penalty,
+                    'stage_hours': stage_hours,
+                    'prices_e': P_e_t_stage,
+                    'prices_c': P_c_t_stage,
+                    'inflow': I_t_stage,
+                    'regime': int(regime),
+                    'reserve_level': reserve_level,
+                }
+
+                current_reservoir = end_reservoir
+
+                if n < num_stages - 1:
+                    if sample_forward_scenarios:
+                        Pn = MARKOV_P_BY_STAGE[int(n)]
+                        current_regime = int(rng.choice(3, p=Pn[int(regime), :]))
+                    else:
+                        current_regime = int(regime)
+
+            forward_paths.append(forward_path)
+        
+        
+        # BACKWARD PASS 
+        print("\n--- Backward Pass ---")
+        for n in range(num_stages - 2, -1, -1):
+            visited_states = set()
+            for fp in forward_paths:
+                visited_states.add(round(float(fp[n]['end_reservoir']), 6))
+            uniq_states = list(visited_states)
+            next_stage_hours = stages[n + 1]
+            print(f"  Backward stage {n+1}/{num_stages-1}, {len(uniq_states)} state(s)...")
+            for v_n in uniq_states:
+                Q_exp = 0.0
+                lambda_exp = 0.0
+                delkutt = []
+                regime_kutt = []
+
+        
+                _next_level = reserve_level_per_stage[n + 1]
+                from block_scenarios import build_stage_joint_scenarios_from_blocks
+                scen_map = {
+                    _r: build_stage_joint_scenarios_from_blocks(
+                        stage_index=int(n + 1),
+                        stage_hours=list(next_stage_hours),
+                        base_P_e_t=P_e_t,
+                        base_P_c_t=P_c_t[_r][_next_level],
+                        base_I_t=I_t,
+                        data=BLOCK_DATA,
+                        da_market="DA",
+                        energy_markets=list(E),
+                        capacity_markets=list(C),
+                    )
+                    for _r in range(3)
+                }
+
+                print(f"    {'r_curr':>6} {'r_next':>6} {'p(Markov)':>10} {'Q':>12} {'λ':>10} {'vekt':>8}")
+                print(f"    {'-'*56}")
+                for r_curr in range(3):
+                    mu_r = MU[n][r_curr] if 'MU' in globals() else 1.0/3.0
+                    probs = MARKOV_P_BY_STAGE[int(n)][int(r_curr), :]
+                    Q_r = 0.0
+                    lambda_r = 0.0
+                    for r_next in range(3):
+                        markov_prob = float(probs[r_next])
+                        joint_prob = markov_prob
+                        scen_list = scen_map[r_next]
+                        match = [x for x in scen_list if int(x[4]) == int(r_next)]
+                        P_e_t_next, P_c_t_next, I_t_next, _, _ = match[0] if match else scen_list[0]
+                        model_next = stage_models[(n + 1, int(r_next))]
+                        update_model_prices(model_next, P_e_t_next, P_c_t_next)
+                        update_model_inflow(model_next, I_t_next)
+                        update_model_state(model_next, v_n, None)
+                        results_next = solver.solve(model_next, tee=False)
+                        
+                        Q = float(pyo.value(model_next.OBJ))
+                        lambda_v = float(model_next.dual[model_next.Start_Reservoir_Level_Def])
+                        vekt = mu_r * joint_prob
+                        print(f"    {r_curr:>6} {r_next:>6} {markov_prob:>10.3f} {Q:>12.2f} {lambda_v:>10.4f} {vekt:>8.5f}")
+                        delkutt.append((r_curr, r_next, _next_level, vekt, Q, lambda_v))
+                        Q_r += joint_prob * Q
+                        lambda_r += joint_prob * lambda_v
+                        Q_exp += vekt * Q
+                        lambda_exp += vekt * lambda_v
+                    print(f"    {'':>6} {'sum':>6} {'':>10} μ={mu_r:.3f}  E[Q]={mu_r*Q_r:10.2f}  E[λ]={mu_r*lambda_r:8.4f}")
+                    regime_kutt.append((r_curr, mu_r*Q_r, mu_r*lambda_r))
+                print(f"    {'-'*56}")
+                cut = {'intercept': Q_exp, 'slope_v': lambda_exp, 'state_v': v_n}
+                print(f"  CUT:  Stage {n+1:>2} | v={v_n:.4f} GWh | θ ≤ {Q_exp:.2f} + {lambda_exp:.4f}·(s_end − {v_n:.4f})")
+                K_stages[n].append(cut)
+
+                # Append to all regimes:
+                for r in range(3):
+                    add_cuts_to_model(stage_models[(n, r)], [cut])
+        
+    
+        # Store results 
+        path_revenues = [sum(fp[n]['revenue'] for n in range(num_stages)) for fp in forward_paths]
+        path_penalties = [sum(fp[n]['penalty'] for n in range(num_stages)) for fp in forward_paths]
+        total_revenue = float(np.mean(path_revenues))
+        total_penalty = float(np.mean(path_penalties))
+        
+        # Calculate aggregate statistics
+        total_capacity_sales = {c: 0.0 for c in C}
+        total_energy_sales = {e: 0.0 for e in E}
+        total_production_mwh = 0.0
+        total_spill = 0.0
+        reservoir_levels = []
+        
+        # Detailed production/sales accounting: use the first forward path as a representative trajectory.
+        forward_path = forward_paths[0]
+
+        for n in range(num_stages):
+            stage_hours = forward_path[n]['stage_hours']
+            model_stage = stage_models[(n, int(forward_path[n]['regime']))]
+
+            
+            # Capacity sales (current stage)
+            for c in C:
+                for t in stage_hours:
+                    total_capacity_sales[c] += pyo.value(model_stage.y_c_t[c, t])
+            
+            # Energy sales/purchases
+            for e in E:
+                for t in stage_hours:
+                    total_energy_sales[e] += pyo.value(model_stage.x_e_t[e, t])
+            
+            # Production
+            for t in stage_hours:
+                prod = sum(pyo.value(model_stage.x_e_t[e, t]) for e in E if e != "ID Buy") - pyo.value(model_stage.x_e_t["ID Buy", t])
+                total_production_mwh += prod
+            
+            # Reservoir levels
+            reservoir_levels.append(forward_path[n]['start_reservoir'])
+            if n == num_stages - 1:
+                reservoir_levels.append(forward_path[n]['end_reservoir'])
+            
+            
+        
+        avg_reservoir = sum(reservoir_levels) / len(reservoir_levels)
+        
+        iteration_results.append({
+            'iteration': iteration + 1,
+            'revenue': total_revenue,
+            'penalty': total_penalty,
+            'actual_value': total_revenue - total_penalty,
+            'stage_results': forward_path,
+            'capacity_sales': total_capacity_sales.copy(),
+            'energy_sales': total_energy_sales.copy(),
+            'total_production': total_production_mwh,
+            'avg_reservoir': avg_reservoir,
+            'total_spill': total_spill
+        })
+        
+        print(f"\n{'='*60}")
+        print(f"Iteration {iteration + 1} Complete")
+        print(f"{'='*60}")
+        print(f"Total Revenue (actual income): {total_revenue:.2f} EUR")
+        if total_penalty > 0.01:
+            print(f"Total penalty cost: {total_penalty:.2f} EUR")
+        print(f"\nProduction & Sales:")
+        print(f"  Total production: {total_production_mwh:.2f} MWh ({total_production_mwh/1000:.2f} GWh)")
+        print(f"  Energy sales:")
+        for e in E:
+            if e != "ID Buy":
+                print(f"    {e}: {total_energy_sales[e]:.2f} MWh")
+            else:
+                print(f"    {e} (purchase): {total_energy_sales[e]:.2f} MWh")
+        print(f"  Capacity sales (total MW⋅h):")
+        for c in C:
+            print(f"    {c}: {total_capacity_sales[c]:.2f} MW⋅h")
+        print(f"\nReservoir & Water:")
+        print(f"  Average reservoir level: {avg_reservoir:.2f} GWh")
+        print(f"  Start: {reservoir_levels[0]:.2f} GWh, End: {reservoir_levels[-1]:.2f} GWh")
+    
+        print(f"\nAlgorithm Progress:")
+        print(f"  Total cuts: {sum(len(K_stages[n]) for n in range(num_stages - 1))}")
+        print(f"{'='*60}")
+        
+
+        valid_LB_samples = []   
+        valid_flags = [pen <= 1.0 for pen in path_penalties]
+        for lb, ok in zip(path_LBs, valid_flags):
+            if ok:
+                valid_LB_samples.append(float(lb))
+
+    print("SDDP Algorithm Complete")
+
+    
+    return {
+        'iterations': iteration_results,
+        'cuts': K_stages,
+        'num_stages': num_stages,
+        'lower_bound_samples': valid_LB_samples,
+        'lb_mean_history': lb_mean_history,
+    }
+
+
+def main():
+    print("\n\nRunning Adaptive SDDP Algorithm...")
+    return sddp_algorithm_adaptive(
+        STAGES,
+        max_iterations=50,
+        num_scenarios=3,
+        convergence_tol=0.01,
+        num_forward_paths=1,
+    )
+
+
+if __name__ == "__main__":
+    print("RUNNING SDDP WITH CUT SAVING")
+    
+   
+    sddp_results = main()
+    
+    
+    filepath_run1 = save_cuts_to_pickle(sddp_results, "Navn_på_fil")
+    
+    
+    
+    cut_files = [
+        Path(__file__).resolve().parent / "Navn_på_kutt_fil.pkl",
+    ]
+    
+    
+    existing_files = [f for f in cut_files if Path(f).exists()]
+    if existing_files:
+        for f in existing_files:
+            print(f"  - {f.name}")
+        
+        combined_K_stages, combined_filepath = combine_cuts_from_multiple_runs(existing_files)
+        print()
+        
+        print("-" * 80)
+        is_valid, report = validate_cuts_structure(combined_K_stages, num_stages=NUM_STAGES)
+        print()
+        
+        print("-" * 80)
+        summary_filepath = create_cuts_summary(combined_K_stages)
+        print()
+        
+        
+        print("-" * 80)
+        K_stages_loaded = load_cuts_from_pickle(combined_filepath)
+        
+    
+
+
+
+

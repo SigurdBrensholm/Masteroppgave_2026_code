@@ -1,0 +1,590 @@
+import pickle
+import pandas as pd
+import numpy as np
+import pyomo.environ as pyo
+from pyomo.opt import SolverFactory
+from pathlib import Path
+from datetime import datetime
+
+
+# Constants and parameters from SDDP model
+E = ["DA", "ID Sell", "ID Buy"]  # Energy markets  
+C = ["aFRR Up", "aFRR Down", "FCR-N", "FCR-D"]  # Capacity markets
+C_d = ["aFRR Down", "FCR-N"]  # Subset of C with Downward capacity markets
+C_u = ["aFRR Up", "FCR-N", "FCR-D"]  # Subset of C with Upward capacity markets
+
+# Plant parameters
+C_max = "# Value #"
+C_min = "# Value #"
+S_max = "# Value #"
+S_min = "# Value #"
+S_0 = "# Value #"
+
+
+
+
+# Market limits (placeholder values)
+V_c_t_max_orig = {"aFRR Up": "# Value #", "aFRR Down": "# Value #", "FCR-N": "# Value #", "FCR-D": "# Value #"}
+A_e = {"ID Sell": "# Value #", "ID Buy": "# Value #"}
+
+
+def load_cuts_from_pickle(filepath):
+    
+
+    with open(filepath, 'rb') as f:
+        K_stages = pickle.load(f)
+    
+    print(f"Loaded cuts from: {filepath}")
+    print(f"  Number of stages/regimes: {len(K_stages)}")
+    
+    return K_stages
+
+
+def get_turbine_generator_data():
+    # CODE # 
+    # Data removed for confidentiality # 
+    return turbin_list_MW, gen_out
+
+
+def create_coeff(x_points, y_points):
+    """
+    Create piecewise linear coefficients (slopes and intercepts) for turbine-generator efficiency.
+    """
+    m_list = []
+    b_list = []
+    for i in range(len(x_points) - 1):
+        x1, x2 = x_points[i], x_points[i + 1]
+        y1, y2 = y_points[i], y_points[i + 1]
+        m = (y2 - y1) / (x2 - x1)
+        b = y1
+        m_list.append(m)
+        b_list.append(b)
+    return np.array(m_list), np.array(b_list)
+
+
+def create_stage_model(stage_hours, E, C, C_d, C_u, P_e_t, P_c_t, I_t,
+                       C_max, C_min, S_max, S_min, eta_plant,
+                       V_c_t_max, V_e_t_max, S_start, A_e, cuts,
+                       y_c_fixed=None, next_stage_hours=None,
+                       is_last_stage=False, S_end_target=None, S_end_min=None,
+                       delta_up=0.0175, delta_down=0.0095, allow_end_slack=False):
+    """Create optimization model for one stage (period) - matches SDDP model signature exactly."""
+    model = pyo.ConcreteModel()
+    
+    ### Sets ###
+    model.T = pyo.Set(initialize=stage_hours, ordered=True)
+    model.E = pyo.Set(initialize=E)
+    model.C = pyo.Set(initialize=C)
+    model.C_d = pyo.Set(initialize=C_d)
+    model.C_u = pyo.Set(initialize=C_u)
+    
+    ### Parameters ###
+    model.P_e_t = pyo.Param(model.E, model.T, initialize=lambda model, e, t: P_e_t.get((e, t), 0), mutable=True)
+    model.P_c_t = pyo.Param(model.C, model.T, initialize=lambda model, c, t: P_c_t.get((c, t), 0), mutable=True)
+    model.I_t = pyo.Param(model.T, initialize=lambda model, t: I_t.get(t, 0), mutable=True)
+    model.C_max = pyo.Param(initialize=C_max)
+    model.C_min = pyo.Param(initialize=C_min)
+    model.S_max = pyo.Param(initialize=S_max)
+    model.S_min = pyo.Param(initialize=S_min)
+    model.eta_plant = pyo.Param(initialize=eta_plant)
+    model.V_c_t_max = pyo.Param(model.C, model.T, initialize=lambda model, c, t: V_c_t_max.get((c, t), 0))
+    model.V_e_t_max = pyo.Param(model.E, model.T, initialize=lambda model, e, t: V_e_t_max.get((e, t), 0))
+    model.S_start = pyo.Param(initialize=S_start, mutable=True)
+    model.A_e = pyo.Param(model.E - {"DA"}, initialize=A_e, mutable=True)
+    model.delta_up = pyo.Param(initialize=delta_up)
+    model.delta_down = pyo.Param(initialize=delta_down)
+    
+    ### Decision variables ###
+    model.x_e_t = pyo.Var(model.E, model.T, domain=pyo.NonNegativeReals)
+    model.y_c_t = pyo.Var(model.C, model.T, domain=pyo.NonNegativeReals)
+    model.s_t = pyo.Var(model.T, within=pyo.NonNegativeReals)
+    model.P_hyd = pyo.Var(model.T, within=pyo.NonNegativeReals)
+    model.P_shaft = pyo.Var(model.T, within=pyo.NonNegativeReals)
+    model.s_end = pyo.Var(within=pyo.NonNegativeReals)
+    model.s_start_week = pyo.Var(within=pyo.NonNegativeReals)
+    
+    # Future value approximation (theta variable for cuts)
+    model.theta = pyo.Var(within=pyo.Reals)
+    # Fix theta only in the terminal stage.
+    if is_last_stage:
+        model.theta.fix(0)
+    
+    
+    ### Objective Function ###
+    def objective_function(model):
+        immediate_value = (
+            sum(model.P_e_t[e, t] * model.x_e_t[e, t] for e in model.E if e != "ID Buy" for t in model.T) +
+            sum(model.P_c_t[c, t] * model.y_c_t[c, t] for c in model.C for t in model.T) -
+            sum(model.P_e_t["ID Buy", t] * model.x_e_t["ID Buy", t] for t in model.T)
+        )
+        return immediate_value
+    
+    model.OBJ = pyo.Objective(rule=objective_function, sense=pyo.maximize)
+    model.dual = pyo.Suffix(direction=pyo.Suffix.IMPORT)
+    
+    ### Constraints ###
+    def start_reservoir_level_def_rule(model):
+        return model.s_start_week == model.S_start
+    model.Start_Reservoir_Level_Def = pyo.Constraint(rule=start_reservoir_level_def_rule)
+
+    def initial_reservoir_balance_rule(model):
+        t0 = min(model.T)
+        return (
+            model.s_t[t0]
+            == model.s_start_week + model.I_t[t0] + model.ex_water_inflow - model.P_hyd[t0] / 1000
+        )
+    model.Initial_Reservoir_Balance = pyo.Constraint(rule=initial_reservoir_balance_rule)
+    
+    def end_reservoir_level_rule(model):
+        return model.s_end == model.s_t[max(model.T)]
+    model.End_Reservoir_Level_Def = pyo.Constraint(rule=end_reservoir_level_rule)
+    
+    if is_last_stage and S_end_target is not None:
+        def end_reservoir_target_min_rule(model):
+            return model.s_end == "# Value #"
+        def end_reservoir_target_max_rule(model):
+            return model.s_end == "# Value #"
+        model.End_Reservoir_Target_Min = pyo.Constraint(rule=end_reservoir_target_min_rule)
+        model.End_Reservoir_Target_Max = pyo.Constraint(rule=end_reservoir_target_max_rule)
+    
+    # Cuts from future periods (Benders cuts)
+    model.cut_constraints = pyo.ConstraintList()
+    # Use cuts only when not in the terminal stage.
+    if cuts and not is_last_stage:
+        model.theta.unfix()
+        for cut in cuts:
+            expr = cut['intercept'] + cut['slope_v'] * (model.s_end - cut['state_v'])
+            model.cut_constraints.add(model.theta <= expr)
+    
+    # Turbine capacity constraints
+    def turbine_capacity_rule_max(model, t):
+        production = sum(model.x_e_t[e, t] for e in model.E if e != "ID Buy") - model.x_e_t["ID Buy", t]
+        return production <= model.C_max
+    model.Turbine_Capacity_Max = pyo.Constraint(model.T, rule=turbine_capacity_rule_max)
+    
+    # Reservoir storage constraints
+    def reservoir_storage_rule_max(model, t):
+        return model.s_t[t] <= model.S_max - model.delta_down
+    model.Reservoir_Storage_Max = pyo.Constraint(model.T, rule=reservoir_storage_rule_max)
+    
+    def reservoir_storage_rule_min(model, t):
+        return model.s_t[t] >= model.S_min + model.delta_up
+    model.Reservoir_Storage_Min = pyo.Constraint(model.T, rule=reservoir_storage_rule_min)
+    
+    # PQ constraint (turbine and generator efficiency)
+    turbin_list_MW, gen_out = get_turbine_generator_data()
+    m_turb, b_gen = create_coeff(turbin_list_MW, gen_out)
+    
+    def pq_constraint_rule(model, t, i):
+        production = sum(model.x_e_t[e, t] for e in model.E if e != "ID Buy") - model.x_e_t["ID Buy", t]
+        return production <= m_turb[i] * (model.P_hyd[t] - turbin_list_MW[i]) + b_gen[i]
+    model.pq_constraint = pyo.Constraint(model.T, range(len(m_turb)), rule=pq_constraint_rule)
+    
+    # Minimum production constraint
+    def turbine_capacity_min_rule(model, t):
+        production = sum(model.x_e_t[e, t] for e in model.E if e != "ID Buy") - model.x_e_t["ID Buy", t]
+        return production >= model.C_min
+    model.Turbine_Capacity_Min = pyo.Constraint(model.T, rule=turbine_capacity_min_rule)
+    
+    # Reservoir balance (no spill)
+    def reservoir_balance_rule(model, t):
+        if t == min(model.T):
+            return pyo.Constraint.Skip
+        return model.s_t[t] == model.s_t[t-1] + model.I_t[t] - model.P_hyd[t] / 1000
+    model.Reservoir_Balance = pyo.Constraint(model.T, rule=reservoir_balance_rule)
+    
+    # Bidding constraints
+    def bidding_constraint_down_rule(model, t):
+        production = sum(model.x_e_t[e, t] for e in model.E if e != "ID Buy") - model.x_e_t["ID Buy", t]
+        return sum(model.y_c_t[c, t] for c in model.C_d) <= production - model.C_min
+    model.Bidding_Constraint_Down = pyo.Constraint(model.T, rule=bidding_constraint_down_rule)
+    
+    def bidding_constraint_up_rule(model, t):
+        production = sum(model.x_e_t[e, t] for e in model.E if e != "ID Buy") - model.x_e_t["ID Buy", t]
+        return sum(model.y_c_t[c, t] for c in model.C_u) <= model.C_max - production
+    model.Bidding_Constraint_Up = pyo.Constraint(model.T, rule=bidding_constraint_up_rule)
+    
+    # Capacity market limits
+    def capacity_market_limit_rule(model, c, t):
+        return model.y_c_t[c, t] <= model.V_c_t_max[c, t]
+    model.Capacity_Market_Limit = pyo.Constraint(model.C, model.T, rule=capacity_market_limit_rule)
+    
+    # Intraday market limits
+    def intraday_market_limit_rule(model, e, t):
+        if e == "DA":
+            return pyo.Constraint.Skip
+        return model.x_e_t[e, t] <= model.V_e_t_max[e, t] * model.A_e[e]
+    model.Intraday_Market_Limit = pyo.Constraint(model.E, model.T, rule=intraday_market_limit_rule)
+    
+    return model
+
+
+# Constants
+SIMULATION_YEARS = list(range(1981, 2025))  # 44 years = 44 synthetic reserve scenarios
+STAGES = [list(range(w*168, (w+1)*168)) for w in range(52)]  # Weekly stages
+
+T = list(range(0, 8736))
+A_e = {"ID Sell": "# Value #", "ID Buy": "# Value #"}
+
+# Scaling factors:
+_BASE_C_MAX = "# Value #"
+_BASE_RESERVES = {"aFRR Up": "# Value #", "aFRR Down": "# Value #", "FCR-N": "# Value #", "FCR-D": "# Value #"}
+
+def _make_capacity_config(nominal, with_reserve=True):
+    
+    if nominal == # Value # :
+        c_max = _BASE_C_MAX
+    else:
+        c_max = nominal * 0.987
+    
+    if with_reserve:
+        reserves = {c: (v / _BASE_C_MAX) * c_max for c, v in _BASE_RESERVES.items()}
+    else:
+        reserves = {"aFRR Up": 0, "aFRR Down": 0, "FCR-N": 0, "FCR-D": 0}
+    
+    return {"C_max": c_max, "C_min": 0.0, **reserves}
+
+CAPACITY_CONFIGS = {
+    # With reserve market participation
+    "base":  _make_capacity_config("# Value #", with_reserve=True),
+    "30MW":  _make_capacity_config("# Value #", with_reserve=True),
+    "60MW":  _make_capacity_config("# Value #", with_reserve=True),
+    "90MW":  _make_capacity_config("# Value #", with_reserve=True),
+    # Without reserve market participation
+    "base_no_reserve":  _make_capacity_config("# Value #", with_reserve=False),
+    "30MW_no_reserve":  _make_capacity_config("# Value #", with_reserve=False),
+    "60MW_no_reserve":  _make_capacity_config("# Value #", with_reserve=False),
+    "90MW_no_reserve":  _make_capacity_config("# Value #", with_reserve=False),
+}
+
+def load_cuts_from_pickle_simulation(cuts_file):
+    """Load SDDP cuts from pickle file using embedded function."""
+    return load_cuts_from_pickle(cuts_file)
+
+
+def prepare_pyomo_data(year_data, capacity_scenario):
+    """Convert year data to Pyomo-compatible dictionaries."""
+    
+    # Energy prices
+    P_e_t = {}
+    for i, t in enumerate(T):
+        P_e_t[("DA", t)] = float(year_data['spot_prices'][i])
+        P_e_t[("ID Sell", t)] = float(year_data['id_prices'][i])
+        P_e_t[("ID Buy", t)] = float(year_data['id_prices'][i])
+    
+    # Capacity prices  
+    P_c_t = {}
+    for i, t in enumerate(T):
+        P_c_t[("aFRR Up", t)] = float(year_data['afrr_up_prices'][i])
+        P_c_t[("aFRR Down", t)] = float(year_data['afrr_down_prices'][i])
+        P_c_t[("FCR-N", t)] = float(year_data['fcr_n_prices'][i])
+        P_c_t[("FCR-D", t)] = float(year_data['fcr_d_prices'][i])
+    
+
+    # Volume constraints
+    V_e_t_max = {}
+    for i, t in enumerate(T):
+        V_e_t_max[("ID Sell", t)] = float(year_data['id_sell_volumes'][i])
+        V_e_t_max[("ID Buy", t)] = float(year_data['id_buy_volumes'][i])
+    
+    V_c_t_max = {}
+    for c in C:
+        for t in T:
+            V_c_t_max[(c, t)] = float(capacity_scenario[c])
+    
+    return P_e_t, P_c_t, I_t, V_e_t_max, V_c_t_max
+
+
+def forward_pass_simulation(year, K_stages, year_data, C_max, C_min, capacity_scenario):
+    """Sequential forward pass simulation for one year with SDDP cuts."""
+    
+    # Prepare data
+    P_e_t, P_c_t, I_t, V_e_t_max, V_c_t_max = prepare_pyomo_data(year_data, capacity_scenario)
+    
+    solver = SolverFactory('gurobi')
+    solver.options['DualReductions'] = 0
+    solver.options['Presolve'] = 0
+    
+    current_reservoir = S_0
+    results = []
+    
+    print(f"\n=== Forward pass simulation: {year} ===")
+    
+    for stage_num in range(52):  # 52 weeks
+        stage_hours = STAGES[stage_num]
+        is_last = (stage_num == 51)
+        
+        # Stage data
+        P_e_t_stage = {(e, t): P_e_t[(e, t)] for e in E for t in stage_hours}
+        P_c_t_stage = {(c, t): P_c_t[(c, t)] for c in C for t in stage_hours}
+        I_t_stage = {t: I_t[t] for t in stage_hours}
+        V_c_t_max_stage = {(c, t): V_c_t_max[(c, t)] for c in C for t in stage_hours}
+        V_e_t_max_stage = {(e, t): V_e_t_max[(e, t)] for e in ["ID Sell", "ID Buy"] for t in stage_hours}
+        
+        cuts = K_stages.get(stage_num, [])
+        
+        # Create stage model
+        model = create_stage_model_simulation(
+            stage_hours=stage_hours,
+            E=E, C=C, C_d=C_d, C_u=C_u,
+            P_e_t=P_e_t_stage,
+            P_c_t=P_c_t_stage,
+            I_t=I_t_stage,
+            C_max=C_max, C_min=C_min,
+            S_max=S_max, S_min=S_min,
+            V_c_t_max=V_c_t_max_stage,
+            V_e_t_max=V_e_t_max_stage, 
+            S_start=current_reservoir,
+            A_e=A_e,
+            cuts=cuts,
+            is_last_stage=is_last,
+            S_end_target=S_0 if is_last else None,
+            allow_end_slack=is_last,
+        )
+        
+        # Solve
+        result = solver.solve(model, tee=False)
+        
+        # Extract results
+        end_reservoir = float(pyo.value(model.s_end))
+        stage_obj = float(pyo.value(model.OBJ))
+        theta_val = float(pyo.value(model.theta)) 
+        stage_revenue = stage_obj - theta_val
+        
+        
+        # Hourly details
+        for t in stage_hours:
+            # Production
+            da_prod = float(pyo.value(model.x_e_t["DA", t]))
+            id_sell = float(pyo.value(model.x_e_t["ID Sell", t])) 
+            id_buy = float(pyo.value(model.x_e_t["ID Buy", t]))
+            
+            # Capacity 
+            afrr_up = float(pyo.value(model.y_c_t["aFRR Up", t]))
+            afrr_down = float(pyo.value(model.y_c_t["aFRR Down", t]))
+            fcr_n = float(pyo.value(model.y_c_t["FCR-N", t]))
+            fcr_d = float(pyo.value(model.y_c_t["FCR-D", t]))
+            
+            reservoir = float(pyo.value(model.s_t[t]))
+            
+            # Revenues
+            rev_da = P_e_t_stage[("DA", t)] * da_prod
+            rev_id = P_e_t_stage[("ID Sell", t)] * id_sell - P_e_t_stage[("ID Buy", t)] * id_buy
+            rev_afrr_up = P_c_t_stage[("aFRR Up", t)] * afrr_up
+            rev_afrr_down = P_c_t_stage[("aFRR Down", t)] * afrr_down
+            rev_fcr_n = P_c_t_stage[("FCR-N", t)] * fcr_n
+            rev_fcr_d = P_c_t_stage[("FCR-D", t)] * fcr_d
+            
+            
+            p_hyd = float(pyo.value(model.P_hyd[t])) if hasattr(model, 'P_hyd') and t in model.P_hyd else None
+            net_energy_sold = da_prod + id_sell - id_buy
+            results.append({
+                "Year": year,
+                "Week": stage_num + 1,
+                "Hour": t,
+                "Reservoir_GWh": reservoir,
+                "End_Reservoir_GWh": end_reservoir,
+                "Water_Value_EUR_per_GWh": water_value,
+                "DA_prod_MWh": da_prod,
+                "ID_sell_MWh": id_sell,
+                "ID_buy_MWh": id_buy,
+                "aFRR_up_MW": afrr_up,
+                "aFRR_down_MW": afrr_down, 
+                "FCR_N_MW": fcr_n,
+                "FCR_D_MW": fcr_d,
+                "Spot_price": P_e_t_stage[("DA", t)],
+                "Price_aFRR_up": P_c_t_stage[("aFRR Up", t)],
+                "Price_aFRR_down": P_c_t_stage[("aFRR Down", t)],
+                "Price_FCR_N": P_c_t_stage[("FCR-N", t)],
+                "Price_FCR_D": P_c_t_stage[("FCR-D", t)],
+                "Rev_DA_EUR": rev_da,
+                "Rev_ID_EUR": rev_id,
+                "Rev_aFRR_up_EUR": rev_afrr_up,
+                "Rev_aFRR_down_EUR": rev_afrr_down,
+                "Rev_FCR_N_EUR": rev_fcr_n,
+                "Rev_FCR_D_EUR": rev_fcr_d,
+                "Rev_total_EUR": rev_da + rev_id + rev_afrr_up + rev_afrr_down + rev_fcr_n + rev_fcr_d,
+                "Inflow_GWh": I_t_stage[t],
+                "Ex_Water_GWh": ex_water,
+                "Theta_EUR": theta_val,
+                "Stage_Revenue_EUR": stage_revenue,
+                "P_hyd_MWh_per_h": p_hyd,
+                "Net_energy_sold_MWh": net_energy_sold,
+            })
+        
+        current_reservoir = end_reservoir
+        
+        if stage_num % 10 == 0:
+            print(f"  Week {stage_num+1}/52, Revenue: {stage_revenue:.0f} EUR")
+    
+    total_revenue = sum(r["Rev_total_EUR"] for r in results)
+    print(f"  Total {year} revenue: {total_revenue/1e6:.2f} MEUR")
+    
+    df = pd.DataFrame(results)
+
+   
+    return df
+
+
+# Main function
+def run_simulation(cuts_file=None, forward_seed=None, scenario_name="base_with_reserve",
+                   capacity_config="base"):
+    
+    C_max = cfg["C_max"]
+    C_min = cfg["C_min"]
+    capacity_scenario = {c: cfg[c] for c in C}
+    
+    print("=" * 60)
+    print(f"FORWARD PASS SIMULATION — Scenario: {scenario_name}")
+    print(f"  C_max={C_max} MW, C_min={C_min} MW")
+    print(f"  Reserve caps: {capacity_scenario}")
+    print("=" * 60)
+    
+    print(f"\nLoading cuts from: {cuts_file}")
+    K_stages = load_cuts_from_pickle_simulation(str(cuts_file))
+    
+    # Load synthetic reserve price system (no clustering — random year --> scenario)
+    year_scenario_map, synthetic_data, thema_prices_df, thema_inflow_df = load_synthetic_reserve_system()
+    
+    # Load reserve level
+    sddp_reserve_levels, level_counts = load_sddp_reserve_level_assignments(
+        forward_seed=forward_seed, num_stages=52
+    )
+    
+    # Print reserve level per week
+    print("\nReserve price levels per week:")
+    for w in range(52):
+        print(f"  Week {w+1:>2}: {sddp_reserve_levels[w]}")
+    
+    all_results = []
+    
+    for year in SIMULATION_YEARS:  # All years 1981-2024
+
+        # Load actual year data: spot + inflow from HY{year}
+        year_data = load_year_data(year, thema_prices_df, thema_inflow_df)
+        
+        # This year's randomly assigned reserve scenario (0-43)
+        scenario_idx = year_scenario_map[year]
+        
+        # Build reserve prices: scenario_idx selects row, SDDP level selects CSV
+        reserve_prices = build_synthetic_reserve_prices_with_weekly_assignment(
+            scenario_idx, synthetic_data, sddp_reserve_levels
+        )
+        
+        # Combine actual spot+inflow with year-specific reserve prices
+        full_data = {**year_data, **reserve_prices}
+        
+        print(f"\n Year {year} (reserve scenario {scenario_idx})")
+        
+        # Run simulation for this year
+        year_results = forward_pass_simulation(year, K_stages, full_data, C_max, C_min, capacity_scenario)
+        
+        # Track reserve level + scenario per week
+        for week in range(52):
+            block = week + 1
+            week_mask = year_results['Week'] == block
+            year_results.loc[week_mask, 'Reserve_Level'] = sddp_reserve_levels[week]
+            year_results.loc[week_mask, 'Reserve_Scenario'] = scenario_idx
+        
+        all_results.append(year_results)
+            
+    
+    # Combine and save results
+    if all_results:
+        combined_df = pd.concat(all_results, ignore_index=True)
+        combined_df.insert(0, "Scenario", scenario_name)
+        
+        # Save detailed hourly results
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        seed_suffix = f"_seed{forward_seed}" if forward_seed is not None else "_seedNone"
+        output_dir = BASE_DIR / "Name_of_output_folder"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        hourly_file = output_dir / f"simulation_hourly_{scenario_name}{seed_suffix}_{timestamp}.csv"
+        combined_df.to_csv(hourly_file, index=False, sep=";", decimal=",")
+        print(f"\n Hourly results saved to: {hourly_file}")
+        
+        # Weekly summary with water values
+        weekly_summary = combined_df.groupby(["Year", "Week"]).agg({
+            "Water_Value_EUR_per_GWh": "first",
+            "End_Reservoir_GWh": "first",
+            "DA_prod_MWh": "sum",
+            "ID_sell_MWh": "sum",
+            "ID_buy_MWh": "sum",
+            "Net_energy_sold_MWh": "sum",
+            "P_hyd_MWh_per_h": "sum",
+            "aFRR_up_MW": "mean",
+            "aFRR_down_MW": "mean",
+            "FCR_N_MW": "mean",
+            "FCR_D_MW": "mean",
+            "Rev_DA_EUR": "sum",
+            "Rev_ID_EUR": "sum",
+            "Rev_aFRR_up_EUR": "sum",
+            "Rev_aFRR_down_EUR": "sum",
+            "Rev_FCR_N_EUR": "sum",
+            "Rev_FCR_D_EUR": "sum",
+            "Rev_total_EUR": "sum",
+            "Spot_price": "mean",
+            "Inflow_GWh": "sum",
+        }).reset_index()
+        
+        if 'Reserve_Level' in combined_df.columns:
+            reserve_info = combined_df.groupby(["Year", "Week"]).agg({
+                "Reserve_Level": "first",
+                "Reserve_Scenario": "first",
+            }).reset_index()
+            weekly_summary = weekly_summary.merge(reserve_info, on=["Year", "Week"], how="left")
+        
+        weekly_file = output_dir / f"simulation_weekly_{scenario_name}{seed_suffix}_{timestamp}.csv"
+        weekly_summary.to_csv(weekly_file, index=False, sep=";", decimal=",")
+        print(f" Weekly summary saved to: {weekly_file}")
+        
+        # Yearly summary
+        yearly_summary = combined_df.groupby("Year").agg({
+            "Rev_DA_EUR": "sum",
+            "Rev_ID_EUR": "sum",
+            "Rev_aFRR_up_EUR": "sum",
+            "Rev_aFRR_down_EUR": "sum",
+            "Rev_FCR_N_EUR": "sum",
+            "Rev_FCR_D_EUR": "sum",
+            "Rev_total_EUR": "sum",
+            "DA_prod_MWh": "sum",
+            "ID_sell_MWh": "sum",
+            "ID_buy_MWh": "sum",
+            "Net_energy_sold_MWh": "sum",
+            "P_hyd_MWh_per_h": "sum",
+            "Spot_price": "mean",
+            "Inflow_GWh": "sum",
+        }).reset_index()
+        yearly_summary["Rev_total_MEUR"] = yearly_summary["Rev_total_EUR"] / 1e6
+        yearly_summary["Total_prod_GWh"] = yearly_summary["DA_prod_MWh"] / 1e3
+        yearly_summary["P_hyd_GWh"] = yearly_summary["P_hyd_MWh_per_h"] / 1e3
+        
+        yearly_file = output_dir / f"simulation_yearly_{scenario_name}{seed_suffix}_{timestamp}.csv"
+        yearly_summary.to_csv(yearly_file, index=False, sep=";", decimal=",")
+        print(f" Yearly summary saved to: {yearly_file}")
+        
+        print(f"Simulation complete: {len(all_results)} years")
+        for _, row in yearly_summary.iterrows():
+            print(f"  {int(row['Year'])}: {row['Rev_total_MEUR']:.1f} MEUR, {row['Total_prod_GWh']:.1f} GWh")
+        
+        # SDDP reserve level verification
+        if 'Reserve_Level' in combined_df.columns:
+            actual_levels = combined_df.groupby(['Week', 'Reserve_Level']).size().reset_index(name='hours')
+            unique_weeks = actual_levels['Week'].nunique()
+            print(f"\n Verified: {unique_weeks} weeks using SDDP reserve assignments")
+        
+    
+    return combined_df if all_results else None
+        
+if __name__ == "__main__":
+    
+    forward_seed_used = 47 
+
+    # Simulation run
+    run_simulation(
+        cuts_file="Name_of_cut_file.pkl",
+        forward_seed=forward_seed_used,
+        scenario_name="Name_of_scenarios", # Base_stochastic, 30MW_stochastic, 60MW_stochastic, 90MW_stochastic
+        capacity_config="Name_of_capacity_config",  # 'base', '30MW', '60MW', '90MW'
+    )
