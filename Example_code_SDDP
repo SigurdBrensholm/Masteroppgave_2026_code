@@ -643,7 +643,7 @@ def sddp_algorithm_adaptive(
         total_spill = 0.0
         reservoir_levels = []
         
-        # Detailed production/sales accounting: use the first forward path as a representative trajectory.
+        # Detailed production/sales accounting
         forward_path = forward_paths[0]
 
         for n in range(num_stages):
